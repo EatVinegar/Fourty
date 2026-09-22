@@ -1,0 +1,66 @@
+app:
+  name: 指数基金定投决策助手
+  db_path: data/invest.db
+  request_interval_seconds: 5
+  history_years: 10
+  auto_update_on_first_open: false
+
+valuation:
+  percentile_windows: [5, 10]
+  min_percentile_samples: 60
+
+strategies:
+  valuation_percentile:
+    low_percentile: 30
+    high_percentile: 70
+    low_multiplier: 1.5
+    middle_multiplier: 1.0
+    inflation_rate: 1.01
+  ma_deviation:
+    ma_window: 250
+    percentile_window_years: 5
+    low_percentile: 30
+    high_percentile: 70
+    low_multiplier: 1.5
+    middle_multiplier: 1.0
+    volatility_window: 10
+    annualization_factor: 252
+    volatility_discounts:
+      - {max_pct: 15, discount: 1.00}
+      - {max_pct: 25, discount: 0.90}
+      - {max_pct: 35, discount: 0.75}
+      - {max_pct: 50, discount: 0.60}
+      - {max_pct: null, discount: 0.50}
+
+indexes:
+  hs300:
+    name: 沪深300
+    csi_symbol: "000300"
+    market: CN
+    has_pe: true
+  dividend_lv:
+    name: 红利低波
+    csi_symbol: "H30269"
+    market: CN
+    has_pe: true
+  csi_dividend:
+    name: 红利指数
+    csi_symbol: "000922"
+    market: CN
+    has_pe: true
+  sse50:
+    name: 上证50
+    csi_symbol: "000016"
+    market: CN
+    has_pe: true
+  hstech:
+    name: 恒生科技
+    csi_symbol: "HSTECH"
+    market: HK
+    has_pe: false
+    strategy: ma_only
+
+sources:
+  index_history: stock_zh_index_hist_csindex
+  index_quote: stock_zh_index_spot_sina
+  bond_10y: bond_gb_zh_sina

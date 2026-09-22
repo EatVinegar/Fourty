@@ -1,0 +1,34 @@
+﻿# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# Local data
+data/invest.db
+data/invest.db-*
+data/lake/
+*.log
+!data/.gitkeep
+
+# Temporary files
+temp/
+.temp/
+
+# Secrets
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# OS
+Thumbs.db
+.DS_Store
