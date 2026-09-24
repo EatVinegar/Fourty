@@ -317,6 +317,7 @@ Fourty/
 ├── core/
 │   ├── datasources.py
 │   ├── lake.py
+│   ├── logging_utils.py
 │   ├── valuation.py
 │   ├── strategy_ey.py
 │   └── strategy_pct.py
@@ -328,6 +329,7 @@ Fourty/
 │
 ├── data/
 │   ├── invest.db
+│   ├── app.log
 │   └── lake/
 │       ├── staging/
 │       ├── curated/
@@ -365,6 +367,7 @@ Fourty/
 
 - 数据湖未初始化时显示“初始化数据湖”按钮。
 - 数据湖初始化完成后显示“增量更新数据”按钮。
+- 建湖过程中显示实时进度条、当前指数和处理阶段。
 - 展示沪深300、红利低波、红利指数、上证50和恒生科技。
 - 展示涨跌幅、PE、盈利收益率、5 年和 10 年 PE 百分位。
 - 展示 10 年期国债收益率。
@@ -437,6 +440,54 @@ D:\code\Fourty\.venv\python.exe scripts\build_lake.py --list
 3. 合并为 curated 年度 Parquet。
 4. 生成 derived 指标。
 5. 写入 manifest、state、revision 和质量报告。
+
+### 行情发布时序
+
+数据湖区分正式日线和盘中行情：
+
+- A 股正式日线在 `18:00` 后检查。
+- 港股正式日线在 `19:00` 后检查。
+- 收盘前不请求当日正式日线，也不会把盘中数据写入 curated。
+- 页面显示“当日收盘数据尚未发布”，日线仍使用最近已发布交易日。
+- 盘中价格和涨跌幅单独保存到
+  `data/lake/meta/intraday_quotes.json`，只作为页面浮层。
+
+如果正式数据源在预期时间后仍未发布：
+
+- 第一次等待 30 分钟重试。
+- 第二次等待 60 分钟。
+- 第三次等待 120 分钟。
+- 第四次等待 240 分钟。
+
+重试状态保存在 `data/lake/meta/state/index_daily.json`。
+
+CLI 运行时会同步向标准错误输出进度，例如：
+
+```text
+[1/18] 正在获取 上证50
+[2/18] 上证50 获取完成
+```
+
+## 软件日志
+
+应用日志位置：
+
+```text
+data/app.log
+```
+
+日志使用 Python 标准库 `RotatingFileHandler`：
+
+- 单文件最大 2 MB。
+- 最多保留 3 个历史文件。
+- 自动记录建湖、数据源、国债更新、设置保存等异常。
+- 捕获主线程和后台线程的未处理异常。
+
+日志格式：
+
+```text
+时间 | 级别 | 模块 | 错误信息和堆栈
+```
 ## 数据质量规则
 
 - 日期必须可以解析。

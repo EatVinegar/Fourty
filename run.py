@@ -6,11 +6,15 @@ import subprocess
 import sys
 from pathlib import Path
 
+from core.logging_utils import configure_logging, get_logger, log_exception
+
 
 ROOT = Path(__file__).resolve().parent
+LOGGER = get_logger("fourty.run")
 
 
 def main() -> int:
+    configure_logging()
     command = [
         sys.executable,
         "-m",
@@ -20,7 +24,12 @@ def main() -> int:
         "--server.headless=false",
         "--browser.gatherUsageStats=false",
     ]
-    return subprocess.call(command, cwd=ROOT)
+    LOGGER.info("launch streamlit")
+    try:
+        return subprocess.call(command, cwd=ROOT)
+    except Exception as exc:
+        log_exception(LOGGER, "streamlit launch failed", exc)
+        raise
 
 
 if __name__ == "__main__":

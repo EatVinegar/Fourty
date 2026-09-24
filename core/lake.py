@@ -22,13 +22,18 @@ import shutil
 import sqlite3
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, time as dt_time, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 
 from core import datasources
+from core.logging_utils import get_logger, log_exception
+
+
+LOGGER = get_logger("fourty.lake")
+ProgressCallback = Callable[[dict[str, Any]], None]
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -45,6 +50,12 @@ QUALITY_DIR = META / "quality"
 REQUEST_INTERVAL_SECONDS = 5
 START_DATE = "2016-01-01"
 DATA_VERSION = f"akshare-{datasources.AKSHARE_VERSION}"
+TRADE_CALENDAR_PATH = META / "trade_calendar.parquet"
+MARKET_PUBLISH_TIMES = {
+    "CN": dt_time(18, 0),
+    "HK": dt_time(19, 0),
+}
+RETRY_DELAYS_MINUTES = (30, 60, 120, 240)
 DAILY_COLUMNS = [
     "index_key",
     "trade_date",
@@ -209,6 +220,34 @@ INDEXES = (
 
 def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+def _emit_progress(
+    callback: ProgressCallback | None,
+    *,
+    phase: str,
+    completed: int,
+    total: int,
+    message: str,
+    index_key: str | None = None,
+    rows: int | None = None,
+    error: str | None = None,
+) -> None:
+    if callback is None:
+        return
+    fraction = 0.0 if total <= 0 else min(1.0, completed / total)
+    callback(
+        {
+            "phase": phase,
+            "completed": completed,
+            "total": total,
+            "fraction": fraction,
+            "message": message,
+            "index_key": index_key,
+            "rows": rows,
+            "error": error,
+        }
+    )
 
 
 def _ensure_layout() -> None:
@@ -549,6 +588,15 @@ def lake_status() -> dict[str, Any]:
         if row is not None:
             status["last_run_id"] = row[0]
             status["last_run_status"] = row[1]
+    try:
+        status["incremental"] = incremental_plan()
+    except Exception as exc:
+        status["incremental"] = {
+            "due_indexes": [],
+            "deferred_indexes": [],
+            "pending": {},
+            "error": str(exc),
+        }
     return status
 
 
@@ -757,9 +805,193 @@ def _read_state() -> dict[str, Any]:
     return payload
 
 
+def _load_trade_calendar(force: bool = False) -> pd.DataFrame:
+    """Load and cache the A-share trading calendar."""
+    today = pd.Timestamp(datetime.now().date())
+    if TRADE_CALENDAR_PATH.is_file() and not force:
+        cached = pd.read_parquet(TRADE_CALENDAR_PATH)
+        cached["trade_date"] = pd.to_datetime(cached["trade_date"])
+        if not cached.empty and cached["trade_date"].max() >= today:
+            return cached
+
+    raw = datasources.fetch_trade_calendar_raw()
+    frame = pd.DataFrame(
+        {
+            "trade_date": pd.to_datetime(
+                raw["trade_date"],
+                errors="coerce",
+            ).dt.normalize()
+        }
+    ).dropna(subset=["trade_date"])
+    frame = frame.sort_values("trade_date").drop_duplicates()
+    _atomic_write_parquet(frame, TRADE_CALENDAR_PATH)
+    return frame
+
+
+def _latest_cn_trade_date(calendar: pd.DataFrame, day: pd.Timestamp) -> pd.Timestamp:
+    eligible = calendar.loc[calendar["trade_date"] <= day, "trade_date"]
+    return pd.Timestamp(eligible.max() if not eligible.empty else day)
+
+
+def _latest_hk_weekday(day: pd.Timestamp) -> pd.Timestamp:
+    candidate = day.normalize()
+    while candidate.weekday() >= 5:
+        candidate -= pd.Timedelta(days=1)
+    return candidate
+
+
+def _expected_market_dates(
+    market: str,
+    now: datetime,
+    calendar: pd.DataFrame,
+) -> tuple[pd.Timestamp, pd.Timestamp]:
+    today = pd.Timestamp(now.date())
+    if market == "CN":
+        target = _latest_cn_trade_date(calendar, today)
+        previous = calendar.loc[
+            calendar["trade_date"] < target,
+            "trade_date",
+        ]
+        previous_date = (
+            pd.Timestamp(previous.max()) if not previous.empty else target
+        )
+    else:
+        target = _latest_hk_weekday(today)
+        previous_date = _latest_hk_weekday(target - pd.Timedelta(days=1))
+
+    publish_time = MARKET_PUBLISH_TIMES.get(market, dt_time(18, 0))
+    available = target
+    if target == today and now.time() < publish_time:
+        available = previous_date
+    return target, available
+
+
+def _next_retry_time(now: datetime, retry_count: int) -> str:
+    index = min(max(retry_count, 1), len(RETRY_DELAYS_MINUTES)) - 1
+    return (
+        now + timedelta(minutes=RETRY_DELAYS_MINUTES[index])
+    ).isoformat(timespec="seconds")
+
+
+def incremental_plan(
+    index_keys: list[str] | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Plan due, pending, and deferred incremental work."""
+    current = now or datetime.now()
+    selected = [
+        case
+        for case in INDEXES
+        if index_keys is None or case["index_key"] in index_keys
+    ]
+    state = _read_state()
+    retry_state = state.get("retry", {})
+    calendar = _load_trade_calendar()
+    market_cases: dict[str, list[dict[str, Any]]] = {}
+    for case in selected:
+        market_cases.setdefault(case["market"], []).append(case)
+
+    due_indexes: list[str] = []
+    pending: dict[str, Any] = {}
+    deferred: list[str] = []
+
+    for market, cases in market_cases.items():
+        target, available = _expected_market_dates(market, current, calendar)
+        latest_values = [
+            state.get("indexes", {}).get(case["index_key"])
+            for case in cases
+        ]
+        latest = max(
+            (pd.Timestamp(value) for value in latest_values if value),
+            default=None,
+        )
+        retry = retry_state.get(market, {})
+        next_retry_at = retry.get("next_retry_at")
+        is_deferred = bool(
+            next_retry_at
+            and pd.Timestamp(next_retry_at) > pd.Timestamp(current)
+            and (latest is None or latest < target)
+        )
+
+        for case in cases:
+            value = state.get("indexes", {}).get(case["index_key"])
+            case_latest = pd.Timestamp(value) if value else None
+            if case_latest is None or case_latest < available:
+                if is_deferred:
+                    deferred.append(case["index_key"])
+                else:
+                    due_indexes.append(case["index_key"])
+
+        if latest is None or latest < target:
+            if available < target and not is_deferred:
+                reason = "当日收盘数据尚未发布"
+            elif is_deferred:
+                reason = "等待下一次重试"
+            else:
+                reason = "源端尚未返回预期交易日数据"
+            pending[market] = {
+                "target_trade_date": target.date().isoformat(),
+                "available_trade_date": available.date().isoformat(),
+                "latest_trade_date": (
+                    latest.date().isoformat() if latest is not None else None
+                ),
+                "reason": reason,
+                "next_retry_at": next_retry_at,
+                "retry_count": int(retry.get("retry_count", 0)),
+            }
+
+    return {
+        "due_indexes": due_indexes,
+        "deferred_indexes": deferred,
+        "pending": pending,
+        "checked_at": current.isoformat(timespec="seconds"),
+    }
+
+
+def _update_retry_state(
+    state: dict[str, Any],
+    selected_cases: tuple[dict[str, Any], ...],
+    fetched: dict[str, pd.DataFrame],
+    now: datetime,
+) -> None:
+    retry_state = dict(state.get("retry", {}))
+    calendar = _load_trade_calendar()
+    by_market: dict[str, list[dict[str, Any]]] = {}
+    for case in selected_cases:
+        by_market.setdefault(case["market"], []).append(case)
+
+    for market, cases in by_market.items():
+        target, _ = _expected_market_dates(market, now, calendar)
+        latest_values = [
+            state.get("indexes", {}).get(case["index_key"])
+            for case in cases
+        ]
+        latest = max(
+            (pd.Timestamp(value) for value in latest_values if value),
+            default=None,
+        )
+        previous = retry_state.get(market, {})
+        if latest is not None and latest >= target:
+            retry_state.pop(market, None)
+            continue
+
+        retry_count = int(previous.get("retry_count", 0)) + 1
+        retry_state[market] = {
+            "target_trade_date": target.date().isoformat(),
+            "last_checked_at": now.isoformat(timespec="seconds"),
+            "last_source_date": (
+                latest.date().isoformat() if latest is not None else None
+            ),
+            "retry_count": retry_count,
+            "next_retry_at": _next_retry_time(now, retry_count),
+        }
+    state["retry"] = retry_state
+
+
 def run(
     mode: str = "full",
     index_keys: list[str] | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     if mode not in {"full", "incremental"}:
         raise ValueError("mode must be full or incremental")
@@ -775,6 +1007,67 @@ def run(
     )
     if not selected_cases:
         raise ValueError("没有匹配的指数")
+    incremental_info = None
+    if mode == "incremental":
+        incremental_info = incremental_plan(index_keys)
+        due_keys = set(incremental_info["due_indexes"])
+        selected_cases = tuple(
+            case for case in selected_cases if case["index_key"] in due_keys
+        )
+        if not selected_cases:
+            pending = incremental_info.get("pending", {})
+            status = "pending" if pending else "success"
+            message = (
+                "；".join(
+                    f"{market}: {item['reason']}"
+                    for market, item in pending.items()
+                )
+                or "没有需要增量更新的数据"
+            )
+            finished_at = _now()
+            with sqlite3.connect(MANIFEST_DB) as connection:
+                connection.execute(
+                    """
+                    INSERT INTO ingestion_runs (
+                        run_id, mode, status, started_at, finished_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (run_id, mode, status, started_at, finished_at),
+                )
+            _emit_progress(
+                progress_callback,
+                phase="done",
+                completed=1,
+                total=1,
+                message=message,
+            )
+            return {
+                "run_id": run_id,
+                "mode": mode,
+                "status": status,
+                "message": message,
+                "indexes": [],
+                "rows": {},
+                "errors": {},
+                "metrics": load_metrics().to_dict(orient="records"),
+                "quality": {"findings": []},
+                "catalog_db": str(CATALOG_DB),
+                "incremental": incremental_info,
+            }
+    total_steps = len(selected_cases) + 4
+    _emit_progress(
+        progress_callback,
+        phase="start",
+        completed=0,
+        total=total_steps,
+        message=f"准备{'初始化' if mode == 'full' else '增量'}建湖",
+    )
+    LOGGER.info(
+        "lake run start run_id=%s mode=%s indexes=%s",
+        run_id,
+        mode,
+        ",".join(case["index_key"] for case in selected_cases),
+    )
     with sqlite3.connect(MANIFEST_DB) as connection:
         connection.execute(
             """
@@ -792,6 +1085,14 @@ def run(
             if position:
                 time.sleep(REQUEST_INTERVAL_SECONDS)
             index_key = case["index_key"]
+            _emit_progress(
+                progress_callback,
+                phase="fetching",
+                completed=position,
+                total=total_steps,
+                message=f"正在获取 {case['name']}",
+                index_key=index_key,
+            )
             last_date = previous_state["indexes"].get(index_key)
             if mode == "incremental" and last_date:
                 start_date = (
@@ -821,13 +1122,115 @@ def run(
                 print(f"  rows={len(frame)}")
             except Exception as exc:
                 errors[index_key] = str(exc)
+                log_exception(
+                    LOGGER,
+                    f"lake fetch failed index={index_key}",
+                    exc,
+                )
                 print(f"  failed={type(exc).__name__}: {exc}")
+            finally:
+                _emit_progress(
+                    progress_callback,
+                    phase="fetched",
+                    completed=position + 1,
+                    total=total_steps,
+                    message=(
+                        f"{case['name']} 获取完成"
+                        if index_key not in errors
+                        else f"{case['name']} 获取失败"
+                    ),
+                    index_key=index_key,
+                    rows=len(fetched.get(index_key, ())),
+                    error=errors.get(index_key),
+                )
 
         if not fetched:
             raise RuntimeError("所有指数抓取均失败")
 
+        non_empty_fetched = {
+            key: frame for key, frame in fetched.items() if not frame.empty
+        }
+        if not non_empty_fetched:
+            state_indexes = dict(previous_state.get("indexes", {}))
+            state = {
+                "run_id": run_id,
+                "indexes": state_indexes,
+                "last_success_date": (
+                    max(state_indexes.values()) if state_indexes else None
+                ),
+                "updated_at": _now(),
+            }
+            _update_retry_state(
+                state,
+                selected_cases,
+                fetched,
+                datetime.now(),
+            )
+            (STATE_DIR / "index_daily.json").write_text(
+                json.dumps(state, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            pending = (
+                incremental_info.get("pending", {})
+                if incremental_info is not None
+                else {}
+            )
+            status = "pending" if pending else "warning" if errors else "success"
+            message = (
+                "；".join(
+                    f"{market}: {item['reason']}"
+                    for market, item in pending.items()
+                )
+                or "没有发现新的交易日数据"
+            )
+            with sqlite3.connect(MANIFEST_DB) as connection:
+                connection.execute(
+                    """
+                    UPDATE ingestion_runs
+                    SET status = ?, finished_at = ?, error_message = ?
+                    WHERE run_id = ?
+                    """,
+                    (
+                        status,
+                        _now(),
+                        (
+                            json.dumps(errors, ensure_ascii=False)
+                            if errors
+                            else None
+                        ),
+                        run_id,
+                    ),
+                )
+            _emit_progress(
+                progress_callback,
+                phase="done",
+                completed=total_steps,
+                total=total_steps,
+                message=message,
+            )
+            return {
+                "run_id": run_id,
+                "mode": mode,
+                "status": status,
+                "message": message,
+                "indexes": list(fetched),
+                "rows": {key: 0 for key in fetched},
+                "errors": errors,
+                "metrics": load_metrics().to_dict(orient="records"),
+                "quality": {"findings": []},
+                "catalog_db": str(CATALOG_DB),
+                "incremental": incremental_info,
+            }
+
         master = pd.DataFrame(master_rows)
         _write_staging("index_master", run_id, "all", master)
+        _emit_progress(
+            progress_callback,
+            phase="compact",
+            completed=len(selected_cases),
+            total=total_steps,
+            message="正在合并 staging 数据",
+        )
         if any(not frame.empty for frame in fetched.values()):
             _compact_daily(run_id)
         master_path = _compact_unpartitioned(
@@ -835,7 +1238,21 @@ def run(
             run_id,
             ["index_key"],
         )
+        _emit_progress(
+            progress_callback,
+            phase="derived",
+            completed=len(selected_cases) + 1,
+            total=total_steps,
+            message="正在计算派生指标",
+        )
         metrics = _build_derived()
+        _emit_progress(
+            progress_callback,
+            phase="catalog",
+            completed=len(selected_cases) + 2,
+            total=total_steps,
+            message="正在同步查询目录",
+        )
         _sync_catalog()
         non_empty_fetched = {
             key: frame for key, frame in fetched.items() if not frame.empty
@@ -844,6 +1261,13 @@ def run(
             run_id,
             non_empty_fetched or fetched,
             selected_cases,
+        )
+        _emit_progress(
+            progress_callback,
+            phase="quality",
+            completed=len(selected_cases) + 3,
+            total=total_steps,
+            message="正在检查数据质量",
         )
 
         daily_path = CURATED / "index_daily"
@@ -871,6 +1295,12 @@ def run(
             ),
             "updated_at": _now(),
         }
+        _update_retry_state(
+            state,
+            selected_cases,
+            fetched,
+            datetime.now(),
+        )
         (STATE_DIR / "index_daily.json").write_text(
             json.dumps(state, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -881,6 +1311,13 @@ def run(
             for finding in quality["findings"]
         )
         status = "warning" if errors or has_quality_warning else "success"
+        LOGGER.info(
+            "lake run finish run_id=%s status=%s rows=%s errors=%s",
+            run_id,
+            status,
+            {key: len(frame) for key, frame in fetched.items()},
+            errors,
+        )
         with sqlite3.connect(MANIFEST_DB) as connection:
             connection.execute(
                 """
@@ -895,6 +1332,13 @@ def run(
                     run_id,
                 ),
             )
+        _emit_progress(
+            progress_callback,
+            phase="done",
+            completed=total_steps,
+            total=total_steps,
+            message=f"建湖完成：{status}",
+        )
         return {
             "run_id": run_id,
             "mode": mode,
@@ -907,6 +1351,7 @@ def run(
             "catalog_db": str(CATALOG_DB),
         }
     except Exception as exc:
+        log_exception(LOGGER, f"lake run failed run_id={run_id}", exc)
         with sqlite3.connect(MANIFEST_DB) as connection:
             connection.execute(
                 """
@@ -927,9 +1372,14 @@ def list_indexes() -> tuple[dict[str, Any], ...]:
 def build_lake(
     mode: str = "incremental",
     index_keys: list[str] | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     """Build or incrementally update the local data lake."""
-    return run(mode=mode, index_keys=index_keys)
+    return run(
+        mode=mode,
+        index_keys=index_keys,
+        progress_callback=progress_callback,
+    )
 
 
 def main() -> int:

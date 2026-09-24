@@ -21,6 +21,7 @@ from core.valuation import (
     save_index_settings,
 )
 from app.ui import apply_global_style, format_number
+from core.logging_utils import configure_logging, get_logger, log_exception
 
 
 st.set_page_config(
@@ -29,6 +30,8 @@ st.set_page_config(
     layout="wide",
 )
 apply_global_style()
+configure_logging()
+LOGGER = get_logger("fourty.app.settings")
 
 config = load_config()
 indexes = config["indexes"]
@@ -43,7 +46,6 @@ settings_map = (
 )
 
 st.markdown("## 策略设置")
-st.caption("初始指数价格由策略起始日期自动匹配。")
 
 selected_key = st.sidebar.selectbox(
     "选择指数",
@@ -78,7 +80,7 @@ try:
     )
     preview_columns = st.columns(2)
     preview_columns[0].metric(
-        "自动初始指数价格",
+        "初始指数价格",
         format_number(resolved_price, 4),
     )
     preview_columns[1].metric(
@@ -105,6 +107,7 @@ if submitted:
             for row in settings.itertuples(index=False)
         }
     except Exception as exc:
+        log_exception(LOGGER, f"save settings failed index={selected_key}", exc)
         st.error(str(exc))
 
 st.subheader("当前设置")
@@ -130,7 +133,3 @@ else:
     st.dataframe(display, width="stretch", hide_index=True)
 
 st.divider()
-st.caption(
-    "初始指数价格自动取不晚于策略起始日期的最近一个有效交易日收盘价，"
-    "用于记录策略起点。"
-)

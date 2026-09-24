@@ -54,6 +54,12 @@ INDEX_CONFIGS: dict[str, dict[str, Any]] = {
         "quote_codes": ("000016",),
         "quote_names": ("上证50",),
     },
+    "hstech": {
+        "name": "恒生科技",
+        "csi_symbol": "HSTECH",
+        "quote_codes": ("HSTECH",),
+        "quote_names": ("恒生科技",),
+    },
 }
 
 
@@ -239,6 +245,25 @@ def fetch_csindex_history_raw(
 def fetch_hk_index_daily_raw(symbol: str) -> pd.DataFrame:
     """Call the AKShare Sina Hong Kong index history interface."""
     return ak.stock_hk_index_daily_sina(symbol=symbol)
+
+
+def fetch_trade_calendar_raw() -> pd.DataFrame:
+    """Call the AKShare Sina A-share trading calendar interface."""
+    return ak.tool_trade_date_hist_sina()
+
+
+def fetch_hk_index_quotes() -> pd.DataFrame:
+    """Fetch and normalize Sina Hong Kong index quotes."""
+    raw = ak.stock_hk_index_spot_sina()
+    return _normalize_quote_frame(raw)
+
+
+def match_index_quote(
+    index_key: str,
+    quotes: pd.DataFrame,
+) -> Mapping[str, Any] | None:
+    """Match one configured index against a normalized quote table."""
+    return _match_quote(index_key, quotes)
 
 
 def fetch_index_quotes() -> pd.DataFrame:

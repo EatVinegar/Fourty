@@ -51,7 +51,18 @@ def main() -> int:
         if args.indexes
         else None
     )
-    result = lake.build_lake(mode=args.mode, index_keys=selected)
+    def show_progress(event: dict) -> None:
+        print(
+            f"[{event['completed']}/{event['total']}] "
+            f"{event['message']}",
+            file=sys.stderr,
+        )
+
+    result = lake.build_lake(
+        mode=args.mode,
+        index_keys=selected,
+        progress_callback=show_progress,
+    )
     print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
     return 0
 

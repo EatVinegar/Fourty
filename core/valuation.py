@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import time
+import json
+import os
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping
@@ -11,11 +14,14 @@ import pandas as pd
 import yaml
 
 from core import datasources, lake, strategy_ey, strategy_pct
+from core.logging_utils import get_logger, log_exception
 from db import store
 
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG_PATH = ROOT / "config.yaml"
+INTRADAY_QUOTES_PATH = ROOT / "data" / "lake" / "meta" / "intraday_quotes.json"
+LOGGER = get_logger("fourty.valuation")
 
 
 def load_config(path: str | Path | None = None) -> dict[str, Any]:
@@ -46,10 +52,80 @@ def get_data_lake_status() -> dict[str, Any]:
     return lake.lake_status()
 
 
+def _write_intraday_quotes(payload: dict[str, Any]) -> None:
+    path = INTRADAY_QUOTES_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+
+
+def _read_intraday_quotes() -> dict[str, Any]:
+    path = INTRADAY_QUOTES_PATH
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def refresh_intraday_quotes(
+    config: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Fetch intraday quotes without modifying curated daily history."""
+    active_config = config or load_config()
+    quote_frames: list[pd.DataFrame] = []
+    errors: dict[str, str] = {}
+    for source_name, fetch in (
+        ("CN", datasources.fetch_index_quotes),
+        ("HK", datasources.fetch_hk_index_quotes),
+    ):
+        try:
+            quote_frames.append(fetch())
+        except Exception as exc:
+            errors[source_name] = str(exc)
+            log_exception(LOGGER, f"intraday quote failed source={source_name}", exc)
+
+    if not quote_frames:
+        return {"quotes": {}, "errors": errors}
+
+    quotes = pd.concat(quote_frames, ignore_index=True)
+    captured_at = datetime.now().isoformat(timespec="seconds")
+    result: dict[str, Any] = {}
+    for index_key in active_config["indexes"]:
+        quote = datasources.match_index_quote(index_key, quotes)
+        if quote is None:
+            continue
+        result[index_key] = {
+            "price": float(quote["price"]),
+            "change_pct": (
+                None
+                if pd.isna(quote["change_pct"])
+                else float(quote["change_pct"])
+            ),
+            "quote_code": str(quote["quote_code"]),
+            "quote_name": str(quote["quote_name"]),
+        }
+
+    payload = {
+        "captured_at": captured_at,
+        "trade_date": datetime.now().date().isoformat(),
+        "quotes": result,
+    }
+    _write_intraday_quotes(payload)
+    return {"quotes": result, "errors": errors, **payload}
+
+
 def refresh_all_data(
     config: Mapping[str, Any] | None = None,
     mode: str = "incremental",
     index_keys: list[str] | None = None,
+    progress_callback: Any | None = None,
 ) -> dict[str, Any]:
     """Build the local data lake and refresh the 10-year bond yield."""
     active_config = config or load_config()
@@ -58,12 +134,37 @@ def refresh_all_data(
     errors: dict[str, str] = {}
     saved: dict[str, Any] = {}
 
-    lake_result = lake.build_lake(mode=mode, index_keys=index_keys)
+    def forward_progress(event: dict[str, Any]) -> None:
+        if progress_callback is None:
+            return
+        forwarded = dict(event)
+        forwarded["fraction"] = min(0.9, float(event["fraction"]) * 0.9)
+        progress_callback(forwarded)
+
+    LOGGER.info("refresh start mode=%s index_keys=%s", mode, index_keys)
+    lake_result = lake.build_lake(
+        mode=mode,
+        index_keys=index_keys,
+        progress_callback=forward_progress,
+    )
     saved["lake"] = lake_result
 
     try:
         if interval > 0:
             time.sleep(interval)
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "phase": "bond",
+                    "completed": 0,
+                    "total": 1,
+                    "fraction": 0.95,
+                    "message": "正在更新 10 年期国债收益率",
+                    "index_key": "bond_10y",
+                    "rows": None,
+                    "error": None,
+                }
+            )
         bond_frame = datasources.fetch_cn_10y_yield()
         store.save_bond_yield(bond_frame, db_path)
         saved["bond_10y"] = {
@@ -75,12 +176,48 @@ def refresh_all_data(
         }
     except Exception as exc:
         errors["bond_10y"] = str(exc)
+        log_exception(LOGGER, "bond yield refresh failed", exc)
+
+    try:
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "phase": "intraday",
+                    "completed": 0,
+                    "total": 1,
+                    "fraction": 0.98,
+                    "message": "正在更新盘中行情",
+                    "index_key": None,
+                    "rows": None,
+                    "error": None,
+                }
+            )
+        intraday = refresh_intraday_quotes(active_config)
+        saved["intraday"] = intraday
+        errors.update(intraday.get("errors", {}))
+    except Exception as exc:
+        errors["intraday"] = str(exc)
+        log_exception(LOGGER, "intraday quote refresh failed", exc)
 
     store.set_meta(
         "last_refresh",
         datetime.now().isoformat(timespec="seconds"),
         db_path,
     )
+    if progress_callback is not None:
+        progress_callback(
+            {
+                "phase": "done",
+                "completed": 1,
+                "total": 1,
+                "fraction": 1.0,
+                "message": "数据更新完成",
+                "index_key": None,
+                "rows": None,
+                "error": None,
+            }
+        )
+    LOGGER.info("refresh finish errors=%s", errors)
     return {
         "db_path": str(db_path),
         "saved": saved,
@@ -219,6 +356,7 @@ def _build_lake_snapshots(
                     else float(latest["change_pct"])
                 ),
                 "quote_source": "data_lake/curated/index_daily",
+                "quote_time": None,
                 "pe_ttm": pe_ttm,
                 "earnings_yield_pct": earnings_yield,
                 "pe_percentile_5y": pe_windows.get("pe_percentile_5y"),
@@ -240,7 +378,25 @@ def _build_lake_snapshots(
             }
         )
 
-    return pd.DataFrame(rows), history_map
+    snapshots = pd.DataFrame(rows)
+    overlay = _read_intraday_quotes()
+    if not snapshots.empty and overlay:
+        overlay_date = pd.Timestamp(
+            overlay.get("trade_date") or overlay.get("captured_at")
+        ).normalize()
+        overlay_quotes = overlay.get("quotes", {})
+        for position, row in snapshots.iterrows():
+            quote = overlay_quotes.get(str(row["index_key"]))
+            if not quote:
+                continue
+            history_date = pd.Timestamp(row["history_date"]).normalize()
+            if history_date >= overlay_date:
+                continue
+            snapshots.at[position, "price"] = float(quote["price"])
+            snapshots.at[position, "change_pct"] = quote["change_pct"]
+            snapshots.at[position, "quote_source"] = "intraday"
+            snapshots.at[position, "quote_time"] = overlay.get("captured_at")
+    return snapshots, history_map
 
 
 def _enrich_snapshots(

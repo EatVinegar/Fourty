@@ -20,6 +20,7 @@ from core.valuation import (
     refresh_all_data,
 )
 from app.ui import apply_global_style, format_number, format_valuation_state
+from core.logging_utils import configure_logging, get_logger, log_exception
 
 
 st.set_page_config(
@@ -28,10 +29,21 @@ st.set_page_config(
     layout="wide",
 )
 apply_global_style()
+configure_logging()
+LOGGER = get_logger("fourty.app.detail")
 
 
 config = load_config()
 lake_status = get_data_lake_status()
+pending_markets = lake_status.get("incremental", {}).get("pending", {})
+pending_message = (
+    "；".join(
+        f"{market}：{item['reason']}"
+        for market, item in pending_markets.items()
+    )
+    if pending_markets
+    else None
+)
 indexes = config["indexes"]
 index_key = st.sidebar.selectbox(
     "选择指数",
@@ -46,8 +58,25 @@ build_label = (
 )
 build_mode = "full" if not lake_status["initialized"] else "incremental"
 if st.sidebar.button(build_label, width="stretch"):
-    with st.spinner(f"{build_label}..."):
-        result = refresh_all_data(config, mode=build_mode)
+    progress_bar = st.sidebar.progress(0.0, text=f"{build_label}准备中...")
+
+    def update_progress(event: dict) -> None:
+        progress_bar.progress(
+            min(1.0, max(0.0, float(event.get("fraction", 0.0)))),
+            text=str(event.get("message") or build_label),
+        )
+
+    try:
+        result = refresh_all_data(
+            config,
+            mode=build_mode,
+            progress_callback=update_progress,
+        )
+        progress_bar.progress(1.0, text="数据更新完成")
+    except Exception as exc:
+        log_exception(LOGGER, f"detail refresh failed mode={build_mode}", exc)
+        result = {"errors": {"update": str(exc)}}
+        progress_bar.empty()
     if result["errors"]:
         st.sidebar.error("部分数据更新失败")
     else:
@@ -57,15 +86,23 @@ if st.sidebar.button(build_label, width="stretch"):
 snapshot, history = load_index_detail(index_key, config)
 if snapshot is None or history.empty:
     st.markdown(f"## {indexes[index_key]['name']}")
+    if pending_message:
+        st.warning(pending_message)
     st.warning("暂无本地数据，请先初始化数据湖。")
     st.stop()
 
 st.markdown(f"## {snapshot['index_name']} ({snapshot['csi_symbol']})")
 st.caption(
-    f"行情来源：{snapshot['quote_source']} · "
-    f"估值来源：{snapshot['source']} · "
-    f"PE日期：{snapshot['pe_latest_date']}"
+    f"日线日期：{snapshot.get('history_date') or '—'} · "
+    f"估值日期：{snapshot.get('pe_latest_date') or '—'}"
+    + (
+        f" · 盘中行情：{snapshot.get('quote_time')}"
+        if snapshot.get("quote_time")
+        else ""
+    )
 )
+if pending_message:
+    st.warning(pending_message)
 
 st.markdown("### 行情与估值")
 metric_columns = st.columns(6)
@@ -128,19 +165,11 @@ strategy_detail_columns[3].metric(
 
 initial_amount = snapshot.get("initial_amount")
 if initial_amount is None or pd.isna(initial_amount):
-    st.info("该指数尚未设置初始金额和初始指数价格，金额暂不可计算。")
+    st.info("尚未设置初始金额，金额暂不可计算。")
 else:
-    months_elapsed = snapshot.get("months_elapsed")
-    months_text = (
-        "—"
-        if months_elapsed is None or pd.isna(months_elapsed)
-        else str(int(months_elapsed))
-    )
     st.caption(
         f"初始金额：{format_number(initial_amount, 2, ' 元')} · "
-        f"初始指数价格：{format_number(snapshot.get('initial_index_price'), 4)} · "
-        f"策略起始日期：{snapshot.get('strategy_start_date') or '—'} · "
-        f"已运行月数：{months_text}"
+        f"策略起始日期：{snapshot.get('strategy_start_date') or '—'}"
     )
 
 range_label = st.radio(
@@ -174,7 +203,3 @@ with pe_tab:
         .rename(columns={"pe_ttm": "PE(TTM)"})
     )
     st.line_chart(pe_chart, width="stretch")
-
-st.caption(
-    "指数数据只用于行情和历史估值展示。页面不生成买入、卖出或定投决策。"
-)
