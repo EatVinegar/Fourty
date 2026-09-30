@@ -17,6 +17,7 @@ if str(ROOT) not in sys.path:
 from core.valuation import (
     load_all_index_settings,
     load_config,
+    list_available_indexes,
     resolve_strategy_start_price,
     save_index_settings,
 )
@@ -34,7 +35,18 @@ configure_logging()
 LOGGER = get_logger("fourty.app.settings")
 
 config = load_config()
-indexes = config["indexes"]
+available = list_available_indexes()
+if available.empty:
+    st.markdown("## 策略设置")
+    st.warning("请先初始化数据湖。")
+    st.stop()
+indexes = {
+    str(row.index_key): {
+        "name": str(row.index_name),
+        "csi_symbol": str(row.symbol),
+    }
+    for row in available.itertuples(index=False)
+}
 settings = load_all_index_settings(config)
 settings_map = (
     {

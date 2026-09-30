@@ -14,9 +14,12 @@ if str(ROOT) not in sys.path:
 
 from core.valuation import (
     get_data_lake_status,
+    list_available_indexes,
     load_config,
     load_dashboard_data,
+    load_dashboard_selection,
     refresh_all_data,
+    save_dashboard_selection,
 )
 from app.ui import apply_global_style, format_number, format_valuation_state
 from core.logging_utils import configure_logging, get_logger, log_exception
@@ -58,7 +61,29 @@ def _refresh(config: dict, mode: str) -> dict:
 
 config = load_config()
 lake_status = get_data_lake_status()
-stored_snapshots, bond, last_refresh = load_dashboard_data(config)
+available_indexes = list_available_indexes()
+selected_indexes = load_dashboard_selection(config) if not available_indexes.empty else []
+if not available_indexes.empty:
+    index_names = {
+        str(row.index_key): str(row.index_name)
+        for row in available_indexes.itertuples(index=False)
+    }
+    selected_indexes = st.sidebar.multiselect(
+        "看板显示指数",
+        options=list(index_names),
+        default=selected_indexes,
+        format_func=lambda key: index_names[key],
+    )
+    if not selected_indexes:
+        st.sidebar.warning("看板至少需要显示一个指数。")
+        selected_indexes = load_dashboard_selection(config)
+    elif selected_indexes != load_dashboard_selection(config):
+        save_dashboard_selection(selected_indexes, config)
+
+stored_snapshots, bond, last_refresh = load_dashboard_data(
+    config,
+    index_keys=selected_indexes or None,
+)
 
 st.markdown("## 今日看板")
 st.caption("只展示指数行情和历史估值指标，不生成买入或卖出指令。")

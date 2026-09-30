@@ -52,6 +52,69 @@ def get_data_lake_status() -> dict[str, Any]:
     return lake.lake_status()
 
 
+def list_available_indexes() -> pd.DataFrame:
+    """Return every index currently available in the lake."""
+    if not lake.is_initialized():
+        return pd.DataFrame()
+    master = lake.load_index_master().copy()
+    category_order = {"broad": 1, "strategy": 2, "industry": 3}
+    master["_order"] = master["category"].map(category_order).fillna(99)
+    return (
+        master.sort_values(["_order", "index_name"])
+        .drop(columns="_order")
+        .reset_index(drop=True)
+    )
+
+
+def load_dashboard_selection(
+    config: Mapping[str, Any] | None = None,
+) -> list[str]:
+    """Return persisted dashboard keys or the configured defaults."""
+    active_config = config or load_config()
+    db_path = initialize_database(active_config)
+    available = set(list_available_indexes().get("index_key", []))
+    saved = store.load_dashboard_indexes(db_path)
+    selected = saved or list(active_config["indexes"])
+    return [key for key in selected if key in available]
+
+
+def save_dashboard_selection(
+    index_keys: list[str],
+    config: Mapping[str, Any] | None = None,
+) -> None:
+    """Persist selected dashboard index keys."""
+    active_config = config or load_config()
+    db_path = initialize_database(active_config)
+    available = set(list_available_indexes().get("index_key", []))
+    selected = [key for key in index_keys if key in available]
+    if not selected:
+        raise ValueError("看板至少需要保留一个指数")
+    store.save_dashboard_indexes(selected, db_path)
+
+
+def load_screening_data(
+    config: Mapping[str, Any] | None = None,
+) -> pd.DataFrame:
+    """Load strategy states for every index in the lake."""
+    active_config = config or load_config()
+    db_path = initialize_database(active_config)
+    if not lake.is_initialized():
+        return pd.DataFrame()
+    available = list_available_indexes()
+    index_keys = available["index_key"].astype(str).tolist()
+    snapshots, history_map = _build_lake_snapshots(
+        active_config,
+        db_path,
+        index_keys,
+    )
+    return _enrich_snapshots(
+        snapshots,
+        history_map,
+        active_config,
+        db_path,
+    )
+
+
 def _write_intraday_quotes(payload: dict[str, Any]) -> None:
     path = INTRADAY_QUOTES_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -96,9 +159,31 @@ def refresh_intraday_quotes(
 
     quotes = pd.concat(quote_frames, ignore_index=True)
     captured_at = datetime.now().isoformat(timespec="seconds")
+
+    if lake.is_initialized():
+        master = lake.load_index_master()
+        targets = [
+            (str(row.index_key), str(row.symbol), str(row.index_name))
+            for row in master.itertuples(index=False)
+        ]
+    else:
+        targets = [
+            (
+                str(key),
+                str(value.get("csi_symbol", "")),
+                str(value.get("name", key)),
+            )
+            for key, value in active_config["indexes"].items()
+        ]
+
     result: dict[str, Any] = {}
-    for index_key in active_config["indexes"]:
-        quote = datasources.match_index_quote(index_key, quotes)
+    for index_key, symbol, name in targets:
+        try:
+            quote = datasources.match_index_quote(index_key, quotes)
+        except ValueError:
+            quote = None
+        if quote is None:
+            quote = datasources.match_symbol_quote(symbol, name, quotes)
         if quote is None:
             continue
         result[index_key] = {
@@ -227,6 +312,7 @@ def refresh_all_data(
 
 def load_dashboard_data(
     config: Mapping[str, Any] | None = None,
+    index_keys: list[str] | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any] | None, str | None]:
     """Load dashboard data from the local lake and latest bond yield."""
     active_config = config or load_config()
@@ -236,7 +322,16 @@ def load_dashboard_data(
             "last_refresh", db_path
         )
 
-    snapshots, history_map = _build_lake_snapshots(active_config, db_path)
+    selected_keys = (
+        index_keys
+        or store.load_dashboard_indexes(db_path)
+        or list(active_config["indexes"])
+    )
+    snapshots, history_map = _build_lake_snapshots(
+        active_config,
+        db_path,
+        selected_keys,
+    )
     snapshots = _enrich_snapshots(
         snapshots,
         history_map,
@@ -258,7 +353,11 @@ def load_index_detail(
     if not lake.is_initialized():
         return None, pd.DataFrame()
 
-    snapshots, history_map = _build_lake_snapshots(active_config, db_path)
+    snapshots, history_map = _build_lake_snapshots(
+        active_config,
+        db_path,
+        [index_key],
+    )
     snapshots = _enrich_snapshots(
         snapshots,
         history_map,
@@ -285,14 +384,17 @@ def _settings_map(settings: pd.DataFrame) -> dict[str, dict[str, Any]]:
 def _build_lake_snapshots(
     config: Mapping[str, Any],
     db_path: Path,
+    index_keys: list[str] | None = None,
 ) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
     """Build dashboard snapshots directly from curated lake data."""
-    ui_keys = list(config["indexes"])
-    daily = lake.load_daily(ui_keys)
+    master = lake.load_index_master().set_index("index_key")
+    selected_keys = list(index_keys or config["indexes"])
+    available_keys = [key for key in selected_keys if key in master.index]
+    daily = lake.load_daily(available_keys)
     history_map: dict[str, pd.DataFrame] = {}
     rows: list[dict[str, Any]] = []
 
-    for index_key in ui_keys:
+    for index_key in available_keys:
         group = daily.loc[daily["index_key"] == index_key].copy()
         if group.empty:
             continue
@@ -315,8 +417,8 @@ def _build_lake_snapshots(
         history_map[index_key] = group
 
         latest = group.iloc[-1]
-        index_config = config["indexes"][index_key]
-        has_pe = bool(index_config.get("has_pe", True))
+        index_meta = master.loc[index_key]
+        has_pe = bool(index_meta.get("has_pe", True))
         pe_ttm = None
         earnings_yield = None
         pe_latest_date = None
@@ -340,8 +442,10 @@ def _build_lake_snapshots(
         rows.append(
             {
                 "index_key": index_key,
-                "index_name": index_config["name"],
-                "csi_symbol": index_config["csi_symbol"],
+                "index_name": str(index_meta.get("index_name", index_key)),
+                "csi_symbol": str(index_meta.get("symbol", "")),
+                "category": str(index_meta.get("category", "")),
+                "has_pe": int(has_pe),
                 "history_date": latest["trade_date"].date().isoformat(),
                 "history_close": float(latest["close"]),
                 "history_change_pct": (
@@ -440,15 +544,22 @@ def _enrich_snapshots(
             else None
         )
 
-        has_pe = bool(config["indexes"][index_key].get("has_pe", True))
+        has_pe = bool(snapshot.get("has_pe", True))
+        pe_window: dict[str, Any] = {}
+        if has_pe and pd.notna(snapshot.get("pe_ttm")):
+            try:
+                pe_window = strategy_pct.calculate_percentile_windows(
+                    history,
+                    windows=(5,),
+                    min_samples=int(
+                        config["valuation"]["min_percentile_samples"]
+                    ),
+                )
+            except (ValueError, RuntimeError):
+                # PE 历史为空或字段缺失时保持空结果，不影响其它指数展示。
+                pe_window = {}
+
         if has_pe:
-            pe_window = strategy_pct.calculate_percentile_windows(
-                history,
-                windows=(5,),
-                min_samples=int(
-                    config["valuation"]["min_percentile_samples"]
-                ),
-            )
             pe_percentile_5y = pe_window.get("pe_percentile_5y")
             valuation_amount = (
                 strategy_ey.calculate_valuation_percentile_amount(
@@ -524,6 +635,12 @@ def _enrich_snapshots(
                 "strategy_start_date": strategy_start_date,
                 "months_elapsed": months_elapsed,
                 "pe_percentile_5y_strategy": pe_percentile_5y,
+                "pe_percentile_5y_strategy_samples": pe_window.get(
+                    "pe_window_5y_samples", 0
+                ),
+                "pe_percentile_5y_strategy_start": pe_window.get(
+                    "pe_window_5y_start"
+                ),
                 "valuation_state": valuation_amount["state"],
                 "valuation_amplifier": valuation_amount["amplifier"],
                 "valuation_inflation_factor": valuation_amount[
@@ -570,7 +687,11 @@ def save_index_settings(
 ) -> None:
     """Save settings for one index."""
     active_config = config or load_config()
-    if index_key not in active_config["indexes"]:
+    available = list_available_indexes()
+    if (
+        available.empty
+        or index_key not in set(available["index_key"].astype(str))
+    ):
         raise ValueError(f"未知指数: {index_key}")
     if initial_amount <= 0:
         raise ValueError("初始金额必须大于 0")
@@ -597,7 +718,11 @@ def resolve_strategy_start_price(
 ) -> tuple[float, str]:
     """Resolve the latest stored close on or before strategy start date."""
     active_config = config or load_config()
-    if index_key not in active_config["indexes"]:
+    available = list_available_indexes()
+    if (
+        available.empty
+        or index_key not in set(available["index_key"].astype(str))
+    ):
         raise ValueError(f"未知指数: {index_key}")
 
     initialize_database(active_config)
@@ -629,7 +754,13 @@ def load_all_index_settings(
     active_config = config or load_config()
     db_path = initialize_database(active_config)
     settings = store.load_strategy_settings(db_path)
-    order = {key: position for position, key in enumerate(active_config["indexes"])}
+    available = list_available_indexes()
+    order = {
+        str(key): position
+        for position, key in enumerate(
+            available.get("index_key", pd.Series(dtype=str)).astype(str)
+        )
+    }
     if not settings.empty:
         settings["_order"] = settings["index_key"].map(order).fillna(999)
         settings = settings.sort_values("_order").drop(columns="_order")

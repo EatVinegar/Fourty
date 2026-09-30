@@ -266,6 +266,60 @@ def match_index_quote(
     return _match_quote(index_key, quotes)
 
 
+def _normalize_index_code(value: object) -> str:
+    """Strip the market prefix so sh000300 and 000300 compare equal."""
+    text = str(value).strip().upper()
+    for prefix in ("SH", "SZ", "BJ", "CS"):
+        if text.startswith(prefix) and len(text) > len(prefix):
+            return text[len(prefix) :]
+    return text
+
+
+def match_symbol_quote(
+    symbol: str,
+    name: str,
+    quotes: pd.DataFrame,
+) -> Mapping[str, Any] | None:
+    """Match an arbitrary index symbol against a normalized quote table.
+
+    Used for data-lake indices that are not listed in INDEX_CONFIGS. Returns
+    None when the quote source does not carry the index, so callers fall back
+    to the latest curated daily close.
+    """
+    if quotes is None or quotes.empty:
+        return None
+
+    target = _normalize_index_code(symbol)
+    if target:
+        normalized = quotes["quote_code"].map(_normalize_index_code)
+        exact = quotes.loc[normalized == target]
+        if not exact.empty:
+            return exact.iloc[-1].to_dict()
+
+        contained = quotes.loc[
+            quotes["quote_code"].str.contains(
+                re.escape(str(symbol)),
+                case=False,
+                regex=True,
+            )
+        ]
+        if not contained.empty:
+            return contained.iloc[-1].to_dict()
+
+    label = str(name or "").strip()
+    if label:
+        matched = quotes.loc[
+            quotes["quote_name"].str.contains(
+                re.escape(label),
+                case=False,
+                regex=True,
+            )
+        ]
+        if not matched.empty:
+            return matched.iloc[-1].to_dict()
+    return None
+
+
 def fetch_index_quotes() -> pd.DataFrame:
     """Fetch the Sina index quote table once for all configured indices."""
     raw = ak.stock_zh_index_spot_sina()

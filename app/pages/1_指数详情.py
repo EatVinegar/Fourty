@@ -17,6 +17,7 @@ from core.valuation import (
     get_data_lake_status,
     load_config,
     load_index_detail,
+    list_available_indexes,
     refresh_all_data,
 )
 from app.ui import apply_global_style, format_number, format_valuation_state
@@ -44,7 +45,15 @@ pending_message = (
     if pending_markets
     else None
 )
-indexes = config["indexes"]
+available = list_available_indexes()
+if available.empty:
+    st.markdown("## 指数详情")
+    st.warning("请先初始化数据湖。")
+    st.stop()
+indexes = {
+    str(row.index_key): {"name": str(row.index_name)}
+    for row in available.itertuples(index=False)
+}
 index_key = st.sidebar.selectbox(
     "选择指数",
     options=list(indexes),
